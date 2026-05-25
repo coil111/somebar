@@ -1,12 +1,11 @@
-BINS = dwlb
-MANS = dwlb.1
+BINS = mangobar
 
 PREFIX ?= /usr/local
 CFLAGS += -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -g
 
-PROTOCOL_HEADERS = xdg-shell-protocol.h xdg-output-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h dwl-ipc-unstable-v2-protocol.h
-PROTOCOL_SOURCES = xdg-shell-protocol.c xdg-output-unstable-v1-protocol.c wlr-layer-shell-unstable-v1-protocol.c dwl-ipc-unstable-v2-protocol.c
-PROTOCOL_OBJS = xdg-shell-protocol.o xdg-output-unstable-v1-protocol.o wlr-layer-shell-unstable-v1-protocol.o dwl-ipc-unstable-v2-protocol.o
+PROTOCOL_HEADERS = xdg-shell-protocol.h xdg-output-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h
+PROTOCOL_SOURCES = xdg-shell-protocol.c xdg-output-unstable-v1-protocol.c wlr-layer-shell-unstable-v1-protocol.c
+PROTOCOL_OBJS = xdg-shell-protocol.o xdg-output-unstable-v1-protocol.o wlr-layer-shell-unstable-v1-protocol.o
 
 all: $(BINS)
 
@@ -17,12 +16,10 @@ clean:
 	$(RM) $(BINS) $(addsuffix .o,$(BINS)) $(PROTOCOL_OBJS) $(PROTOCOL_HEADERS) $(PROTOCOL_SOURCES) config.h
 
 uninstall:
-	$(RM) $(PREFIX)/bin/dwlb
-	$(RM) $(PREFIX)/share/man/man1/dwlb.1
+	$(RM) $(PREFIX)/bin/$(BINS)
 
 install: all
 	install -D -t $(PREFIX)/bin $(BINS)
-	install -D -m0644 -t $(PREFIX)/share/man/man1 $(MANS)
 
 WAYLAND_PROTOCOLS=$(shell pkg-config --variable=pkgdatadir wayland-protocols)
 WAYLAND_SCANNER=$(shell pkg-config --variable=wayland_scanner wayland-scanner)
@@ -45,19 +42,13 @@ wlr-layer-shell-unstable-v1-protocol.c:
 	$(WAYLAND_SCANNER) private-code protocols/wlr-layer-shell-unstable-v1.xml $@
 wlr-layer-shell-unstable-v1-protocol.o: wlr-layer-shell-unstable-v1-protocol.h
 
-dwl-ipc-unstable-v2-protocol.h:
-	$(WAYLAND_SCANNER) client-header protocols/dwl-ipc-unstable-v2.xml $@
-dwl-ipc-unstable-v2-protocol.c:
-	$(WAYLAND_SCANNER) private-code protocols/dwl-ipc-unstable-v2.xml $@
-dwl-ipc-unstable-v2-protocol.o: dwl-ipc-unstable-v2-protocol.h
+mangobar.o: mangobar.c utf8.h config.h xdg-shell-protocol.h xdg-output-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h
+	$(CC) $(CFLAGS) -c -o $@ $<
 
-dwlb.o: utf8.h config.h xdg-shell-protocol.h xdg-output-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h dwl-ipc-unstable-v2-protocol.h
+mangobar: $(PROTOCOL_OBJS) mangobar.o
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-# Protocol dependencies
-dwlb: $(PROTOCOL_OBJS)
-
-# Library dependencies
-dwlb: CFLAGS+=$(shell pkg-config --cflags wayland-client wayland-cursor fcft pixman-1)
-dwlb: LDLIBS+=$(shell pkg-config --libs wayland-client wayland-cursor fcft pixman-1) -lrt
+mangobar: CFLAGS+=$(shell pkg-config --cflags wayland-client wayland-cursor fcft pixman-1)
+mangobar: LDLIBS+=$(shell pkg-config --libs wayland-client wayland-cursor fcft pixman-1) -lrt -lcjson
 
 .PHONY: all clean install uninstall
