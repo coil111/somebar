@@ -11,9 +11,9 @@ static bool hidden = false;
 // initially draw all bars at the bottom
 static bool bottom = false;
 // hide vacant tags
-static bool hide_vacant = true;
+static bool hide_vacant = false;
 // vertical pixel padding above and below text
-static uint32_t vertical_padding = 3;
+static uint32_t vertical_padding = 1;
 // allow in-line color commands in status text
 static bool status_commands = true;
 // center title text
@@ -27,8 +27,8 @@ static uint32_t buffer_scale = 1;
 // font
 static char *fontstr = "JetBrains Mono:size=12";
 // tag names
-static char *tags_names[] = {"1", "2", "3", "4", "5",  "6",
-                             "7", "8", "9"};
+static char *tags_names[] = {"!", "?", ")", "#", "$",  "%",
+                             "/", "&", ";"};
 
 // set 16-bit colors for bar
 // use either pixman_color_t struct or HEX_COLOR macro for 8-bit colors
