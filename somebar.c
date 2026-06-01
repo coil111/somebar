@@ -1622,6 +1622,7 @@ static void event_loop(void) {
     FD_ZERO(&rfds);
     FD_SET(wl_fd, &rfds);
     FD_SET(sock_fd, &rfds);
+	struct timeval tv = {.tv_sec = 0, .tv_usec = 50000};
     if (!ipc)
       FD_SET(STDIN_FILENO, &rfds);
 
@@ -1639,7 +1640,7 @@ static void event_loop(void) {
 
     wl_display_flush(display);
 
-    if (select(max_fd + 1, &rfds, NULL, NULL, NULL) == -1) {
+    if (select(max_fd + 1, &rfds, NULL, NULL, &tv) == -1) {
       if (errno == EINTR)
         continue;
       EDIE("select");
