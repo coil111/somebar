@@ -3,9 +3,9 @@ BINS = somebar
 PREFIX ?= /usr/local
 CFLAGS += -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -g
 
-PROTOCOL_HEADERS = xdg-shell-protocol.h xdg-output-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h
-PROTOCOL_SOURCES = xdg-shell-protocol.c xdg-output-unstable-v1-protocol.c wlr-layer-shell-unstable-v1-protocol.c
-PROTOCOL_OBJS = xdg-shell-protocol.o xdg-output-unstable-v1-protocol.o wlr-layer-shell-unstable-v1-protocol.o
+PROTOCOL_HEADERS = xdg-shell-protocol.h xdg-output-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h dwl-ipc-unstable-v2-protocol.h
+PROTOCOL_SOURCES = xdg-shell-protocol.c xdg-output-unstable-v1-protocol.c wlr-layer-shell-unstable-v1-protocol.c dwl-ipc-unstable-v2-protocol.c
+PROTOCOL_OBJS = xdg-shell-protocol.o xdg-output-unstable-v1-protocol.o wlr-layer-shell-unstable-v1-protocol.o dwl-ipc-unstable-v2-protocol.o
 
 all: $(BINS)
 
@@ -42,7 +42,13 @@ wlr-layer-shell-unstable-v1-protocol.c:
 	$(WAYLAND_SCANNER) private-code protocols/wlr-layer-shell-unstable-v1.xml $@
 wlr-layer-shell-unstable-v1-protocol.o: wlr-layer-shell-unstable-v1-protocol.h
 
-somebar.o: somebar.c utf8.h config.h xdg-shell-protocol.h xdg-output-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h
+dwl-ipc-unstable-v2-protocol.h: protocols/dwl-ipc-unstable-v2.xml
+	$(WAYLAND_SCANNER) client-header $< $@
+dwl-ipc-unstable-v2-protocol.c: protocols/dwl-ipc-unstable-v2.xml
+	$(WAYLAND_SCANNER) private-code $< $@
+dwl-ipc-unstable-v2-protocol.o: dwl-ipc-unstable-v2-protocol.h
+
+somebar.o: somebar.c utf8.h config.h xdg-shell-protocol.h xdg-output-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h dwl-ipc-unstable-v2-protocol.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 somebar: $(PROTOCOL_OBJS) somebar.o

@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <cjson/cJSON.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -20,8 +21,8 @@
 #include <wayland-client.h>
 #include <wayland-cursor.h>
 #include <wayland-util.h>
-#include <cjson/cJSON.h>                      /* JSON IPC 解析 */
 
+#include "dwl-ipc-unstable-v2-protocol.h"
 #include "utf8.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 #include "xdg-output-unstable-v1-protocol.h"
@@ -63,9 +64,9 @@
 #define PROGRAM "somebar"
 #define VERSION "0.2"
 #define USAGE                                                                  \
-  "usage: somebar [OPTIONS]\n"                                                \
+  "usage: somebar [OPTIONS]\n"                                                 \
   "Ipc\n"                                                                      \
-  "	-ipc				allow commands ipc "                                           \
+  "	-ipc				allow commands ipc "                                               \
   "	-no-ipc				disable ipc\n"                                                  \
   "Bar Config\n"                                                               \
   "	-hidden				bars will initially be hidden\n"                                \
@@ -117,7 +118,7 @@
   "integer scaling\n"                                                          \
   "Commands\n"                                                                 \
   "	-target-socket [SOCKET-NAME]	set the socket to send command to. "          \
-  "Sockets can be found in `$MANGO_INSTANCE_SIGNATURE`\n"                         \
+  "Sockets can be found in `$MANGO_INSTANCE_SIGNATURE`\n"                      \
   "	-status	[OUTPUT] [TEXT]		set status text\n"                                \
   "	-status-stdin	[OUTPUT]		set status text from stdin\n"                      \
   "	-title	[OUTPUT] [TEXT]		set title text, if -custom-title is "              \
@@ -206,11 +207,15 @@ static char sockbuf[4096];
 static char *stdinbuf;
 static size_t stdinbuf_cap;
 
+static char **layout_names;
+static uint32_t layout_names_l;
+
 static struct wl_display *display;
 static struct wl_compositor *compositor;
 static struct wl_shm *shm;
 static struct zwlr_layer_shell_v1 *layer_shell;
 static struct zxdg_output_manager_v1 *output_manager;
+static struct zdwl_ipc_manager_v2 *dwl_ipc_manager;
 
 static struct wl_cursor_image *cursor_image;
 static struct wl_surface *cursor_surface;
@@ -227,7 +232,7 @@ static uint32_t height, textpadding, buffer_scale;
 
 static bool run_display;
 
-/* ---- JSON IPC 相关 ---- */
+/* JSON IPC */
 static int ipc_fd = -1;
 static char ipc_buf[65536];
 static size_t ipc_buf_len = 0;
@@ -428,16 +433,16 @@ static int draw_frame(Bar *bar) {
                                                   .x2 = x + boxs + boxw,
                                                   .y1 = boxs,
                                                   .y2 = boxs + boxw});
-        pixman_image_fill_boxes(PIXMAN_OP_SRC, foreground_mask,
-                                &(pixman_color_t){0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF},
-                                1,
-                                &(pixman_box32_t){.x1 = x + boxs,
-                                                  .x2 = x + boxs + boxw,
-                                                  .y1 = boxs,
-                                                  .y2 = boxs + boxw});
+        pixman_image_fill_boxes(
+            PIXMAN_OP_SRC, foreground_mask,
+            &(pixman_color_t){0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF}, 1,
+            &(pixman_box32_t){.x1 = x + boxs,
+                              .x2 = x + boxs + boxw,
+                              .y1 = boxs,
+                              .y2 = boxs + boxw});
         if ((!bar->sel || !active) && boxw >= 3) {
-          pixman_image_fill_boxes(PIXMAN_OP_SRC, foreground, &(pixman_color_t){0},
-                                  1,
+          pixman_image_fill_boxes(PIXMAN_OP_SRC, foreground,
+                                  &(pixman_color_t){0}, 1,
                                   &(pixman_box32_t){.x1 = x + boxs + 1,
                                                     .x2 = x + boxs + boxw - 1,
                                                     .y1 = boxs + 1,
@@ -452,8 +457,8 @@ static int draw_frame(Bar *bar) {
       }
 
       x = draw_text(tags[i], x, y, foreground, foreground_mask, background,
-                    fg_color, bg_color, bar->width, bar->height, bar->textpadding,
-                    NULL, 0);
+                    fg_color, bg_color, bar->width, bar->height,
+                    bar->textpadding, NULL, 0);
     }
   }
 
@@ -484,14 +489,12 @@ static int draw_frame(Bar *bar) {
       &(pixman_box32_t){.x1 = x, .x2 = nx, .y1 = 0, .y2 = bar->height});
   x = nx;
 
-  x = draw_text(
-    custom_title ? bar->title.text : bar->window_title, x, y, foreground,
-    foreground_mask, background,
-    bar->sel ? &title_fg_color_selected : &title_fg_color,  
-    &middle_bg_color,                                        
-    bar->width - status_width, bar->height, 0,
-    custom_title ? bar->title.colors : NULL,
-    custom_title ? bar->title.colors_l : 0);
+  x = draw_text(custom_title ? bar->title.text : bar->window_title, x, y,
+                foreground, foreground_mask, background,
+                bar->sel ? &title_fg_color_selected : &title_fg_color,
+                &middle_bg_color, bar->width - status_width, bar->height, 0,
+                custom_title ? bar->title.colors : NULL,
+                custom_title ? bar->title.colors_l : 0);
 
   pixman_image_fill_boxes(
       PIXMAN_OP_SRC, background,
@@ -600,7 +603,8 @@ static void pointer_enter(void *data, struct wl_pointer *pointer,
   if (!cursor_image) {
     const char *size_str = getenv("XCURSOR_SIZE");
     int size = size_str ? atoi(size_str) : 0;
-    if (size == 0) size = 24;
+    if (size == 0)
+      size = 24;
     struct wl_cursor_theme *cursor_theme =
         wl_cursor_theme_load(getenv("XCURSOR_THEME"), size * buffer_scale, shm);
     cursor_image =
@@ -636,6 +640,40 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
   seat->pointer_y = wl_fixed_to_int(surface_y);
 }
 
+static void ipc_dispatch_tag(const char *output_name, uint32_t tag_mask) 
+{
+  if (!dwl_ipc_manager)
+    return;
+  Bar *bar;
+  wl_list_for_each(bar, &bar_list, link) {
+    if (!bar->xdg_output_name)
+      continue;
+    if (output_name && strcmp(bar->xdg_output_name, output_name))
+      continue;
+    struct zdwl_ipc_output_v2 *ipc_output =
+        zdwl_ipc_manager_v2_get_output(dwl_ipc_manager, bar->wl_output);
+    zdwl_ipc_output_v2_set_tags(ipc_output, tag_mask, 0);
+    wl_display_flush(display);
+    zdwl_ipc_output_v2_destroy(ipc_output);
+    break;
+  }
+}
+
+static void ipc_dispatch_layout_idx(const char *output_name, uint32_t idx) {
+    if (!dwl_ipc_manager) return;
+    Bar *bar;
+    wl_list_for_each(bar, &bar_list, link) {
+        if (!bar->xdg_output_name) continue;
+        if (output_name && strcmp(bar->xdg_output_name, output_name)) continue;
+        struct zdwl_ipc_output_v2 *ipc_output =
+            zdwl_ipc_manager_v2_get_output(dwl_ipc_manager, bar->wl_output);
+        zdwl_ipc_output_v2_set_layout(ipc_output, idx);
+        wl_display_flush(display);
+        zdwl_ipc_output_v2_destroy(ipc_output);
+        break;
+    }
+}
+
 static void pointer_frame(void *data, struct wl_pointer *pointer) {
   Seat *seat = (Seat *)data;
   if (!seat->pointer_button || !seat->bar)
@@ -657,18 +695,13 @@ static void pointer_frame(void *data, struct wl_pointer *pointer) {
     } while (seat->pointer_x >= x && ++i < tags_l);
 
     if (i < tags_l) {
-      if (ipc && ipc_fd >= 0) {
-        char cmd[256];
+      if (ipc) {
         if (seat->pointer_button == BTN_LEFT)
-          snprintf(cmd, sizeof cmd, "dispatch set_tags %s %u 1\n",
-                   bar->xdg_output_name, 1 << i);
+          ipc_dispatch_tag(bar->xdg_output_name, 1 << i);
         else if (seat->pointer_button == BTN_MIDDLE)
-          snprintf(cmd, sizeof cmd, "dispatch set_tags %s %u 1\n",
-                   bar->xdg_output_name, (unsigned)~0);
+          ipc_dispatch_tag(bar->xdg_output_name, ~0);
         else if (seat->pointer_button == BTN_RIGHT)
-          snprintf(cmd, sizeof cmd, "dispatch set_tags %s %u 0\n",
-                   bar->xdg_output_name, bar->mtags ^ (1 << i));
-        send(ipc_fd, cmd, strlen(cmd), MSG_NOSIGNAL);
+          ipc_dispatch_tag(bar->xdg_output_name, bar->mtags ^ (1 << i));
       }
       seat->pointer_button = 0;
       return;
@@ -677,28 +710,23 @@ static void pointer_frame(void *data, struct wl_pointer *pointer) {
 
   x += TEXT_WIDTH(bar->layout, bar->width - x, bar->textpadding) / buffer_scale;
   if (seat->pointer_x < x) {
-    /* 点击布局 -> JSON IPC dispatch */
-    if (ipc && ipc_fd >= 0) {
-      char cmd[256];
-      if (seat->pointer_button == BTN_LEFT)
-        snprintf(cmd, sizeof cmd, "dispatch set_layout %s %u\n",
-                 bar->xdg_output_name, bar->last_layout_idx);
-      else if (seat->pointer_button == BTN_RIGHT)
-        snprintf(cmd, sizeof cmd, "dispatch set_layout %s 2\n",
-                 bar->xdg_output_name);
-      send(ipc_fd, cmd, strlen(cmd), MSG_NOSIGNAL);
+	/* monocle && dwindle only */
+	if (ipc) {
+		if (seat->pointer_button == BTN_LEFT)
+            ipc_dispatch_layout_idx(bar->xdg_output_name, 
+					bar->layout_idx == 11 ? 3 : 11);
     }
   } else {
-    uint32_t status_x = bar->width / buffer_scale -
-                        TEXT_WIDTH(bar->status.text, bar->width - x,
-                                   bar->textpadding) / buffer_scale;
+    uint32_t status_x =
+        bar->width / buffer_scale -
+        TEXT_WIDTH(bar->status.text, bar->width - x, bar->textpadding) /
+            buffer_scale;
     if (seat->pointer_x < status_x) {
       if (custom_title) {
         if (center_title) {
-          uint32_t title_width =
-              TEXT_WIDTH(bar->title.text, status_x - x, 0);
-          x = MAX(x, MIN((bar->width - title_width) / 2,
-                         status_x - title_width));
+          uint32_t title_width = TEXT_WIDTH(bar->title.text, status_x - x, 0);
+          x = MAX(x,
+                  MIN((bar->width - title_width) / 2, status_x - title_width));
         } else {
           x = MIN(x + bar->textpadding, status_x);
         }
@@ -714,12 +742,10 @@ static void pointer_frame(void *data, struct wl_pointer *pointer) {
     } else {
       for (i = 0; i < bar->status.buttons_l; i++) {
         if (seat->pointer_button == bar->status.buttons[i].btn &&
-            seat->pointer_x >=
-                status_x + bar->textpadding +
-                    bar->status.buttons[i].x1 / buffer_scale &&
-            seat->pointer_x <
-                status_x + bar->textpadding +
-                    bar->status.buttons[i].x2 / buffer_scale) {
+            seat->pointer_x >= status_x + bar->textpadding +
+                                   bar->status.buttons[i].x1 / buffer_scale &&
+            seat->pointer_x < status_x + bar->textpadding +
+                                  bar->status.buttons[i].x2 / buffer_scale) {
           shell_command(bar->status.buttons[i].command);
           break;
         }
@@ -737,10 +763,12 @@ static void pointer_axis_discrete(void *data, struct wl_pointer *pointer,
   uint32_t i;
   uint32_t btn = discrete < 0 ? WheelUp : WheelDown;
   Seat *seat = (Seat *)data;
-  if (!seat->bar) return;
+  if (!seat->bar)
+    return;
   uint32_t status_x = seat->bar->width / buffer_scale -
                       TEXT_WIDTH(seat->bar->status.text, seat->bar->width,
-                                 seat->bar->textpadding) / buffer_scale;
+                                 seat->bar->textpadding) /
+                          buffer_scale;
   if (seat->pointer_x > status_x) {
     for (i = 0; i < seat->bar->status.buttons_l; i++) {
       if (btn == seat->bar->status.buttons[i].btn &&
@@ -830,16 +858,19 @@ static void hide_bar(Bar *bar) {
 
 static void check_auto_hide(Bar *bar) {
   if (!bar->window_title || !bar->appid) {
-    if (bar->hidden) show_bar(bar);
+    if (bar->hidden)
+      show_bar(bar);
     return;
   }
   bool is_terminal =
       (strcmp(bar->appid, "foot") == 0 || strcmp(bar->appid, "kitty") == 0);
   bool is_tmux = (strstr(bar->window_title, "tmux") != NULL);
   if (is_terminal && is_tmux) {
-    if (!bar->hidden) hide_bar(bar);
+    if (!bar->hidden)
+      hide_bar(bar);
   } else {
-    if (bar->hidden) show_bar(bar);
+    if (bar->hidden)
+      show_bar(bar);
   }
 }
 
@@ -855,7 +886,8 @@ static Bar *find_bar_by_name(const char *name) {
 }
 
 static void ipc_update_bar_from_json(Bar *bar, cJSON *json) {
-  if (!bar || !json) return;
+  if (!bar || !json)
+    return;
 
   /* active */
   cJSON *active = cJSON_GetObjectItem(json, "active");
@@ -866,9 +898,11 @@ static void ipc_update_bar_from_json(Bar *bar, cJSON *json) {
   cJSON *layout_sym = cJSON_GetObjectItem(json, "layout_symbol");
   if (cJSON_IsString(layout_sym)) {
     free(bar->layout);
-	const char *sym = layout_sym->valuestring;
-    if      (!strcmp(sym, "DW")) sym = "[]=";
-    else if (!strcmp(sym, "M"))  sym = "[M]";
+    const char *sym = layout_sym->valuestring;
+    if (!strcmp(sym, "DW"))
+      sym = "[]=";
+    else if (!strcmp(sym, "M"))
+      sym = "[M]";
     bar->layout = strdup(sym);
   }
 
@@ -910,7 +944,8 @@ static void ipc_update_bar_from_json(Bar *bar, cJSON *json) {
     cJSON *tag_obj;
     cJSON_ArrayForEach(tag_obj, tags_array) {
       int tag = cJSON_GetObjectItem(tag_obj, "index")->valueint - 1;
-      if (tag < 0 || tag >= 32) continue;
+      if (tag < 0 || tag >= 32)
+        continue;
       if (cJSON_IsTrue(cJSON_GetObjectItem(tag_obj, "is_active")))
         bar->mtags |= (1 << tag);
       if (cJSON_IsTrue(cJSON_GetObjectItem(tag_obj, "is_urgent")))
@@ -939,12 +974,14 @@ static void ipc_update_bar_from_json(Bar *bar, cJSON *json) {
 
 static void ipc_handle_message(const char *msg) {
   cJSON *json = cJSON_Parse(msg);
-  if (!json) return;
+  if (!json)
+    return;
 
   cJSON *name = cJSON_GetObjectItem(json, "name");
   if (cJSON_IsString(name)) {
     Bar *bar = find_bar_by_name(name->valuestring);
-    if (bar) ipc_update_bar_from_json(bar, json);
+    if (bar)
+      ipc_update_bar_from_json(bar, json);
   }
 
   cJSON_Delete(json);
@@ -990,13 +1027,18 @@ static void ipc_connect(void) {
 }
 
 static void ipc_send_watch(Bar *bar) {
-  if (!bar->xdg_output_name) return;
+  if (!bar->xdg_output_name)
+    return;
 
   const char *sock_path = getenv("MANGO_INSTANCE_SIGNATURE");
-  if (!sock_path) return;
+  if (!sock_path)
+    return;
 
   bar->ipc_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (bar->ipc_fd < 0) { perror("bar ipc socket"); return; }
+  if (bar->ipc_fd < 0) {
+    perror("bar ipc socket");
+    return;
+  }
 
   struct sockaddr_un addr = {.sun_family = AF_UNIX};
   strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
@@ -1032,6 +1074,18 @@ static void setup_bar(Bar *bar) {
     show_bar(bar);
 }
 
+static void dwl_ipc_manager_tags(void *data, struct zdwl_ipc_manager_v2 *mgr, uint32_t count) {}
+static void dwl_ipc_manager_layout(void *data, struct zdwl_ipc_manager_v2 *mgr, const char *name) 
+{
+	layout_names = realloc(layout_names, (layout_names_l + 1) * sizeof(char *));
+	layout_names[layout_names_l++] = strdup(name);
+}
+
+static const struct zdwl_ipc_manager_v2_listener dwl_ipc_manager_listener = {
+    .tags = dwl_ipc_manager_tags,
+    .layout = dwl_ipc_manager_layout,
+};
+
 static void handle_global(void *data, struct wl_registry *registry,
                           uint32_t name, const char *interface,
                           uint32_t version) {
@@ -1047,31 +1101,47 @@ static void handle_global(void *data, struct wl_registry *registry,
         wl_registry_bind(registry, name, &zxdg_output_manager_v1_interface, 2);
   } else if (!strcmp(interface, wl_output_interface.name)) {
     Bar *bar = calloc(1, sizeof(Bar));
-    if (!bar) EDIE("calloc");
+    if (!bar)
+      EDIE("calloc");
     bar->registry_name = name;
-	bar->ipc_fd = -1;
+    bar->ipc_fd = -1;
     bar->wl_output = wl_registry_bind(registry, name, &wl_output_interface, 1);
-    if (run_display) setup_bar(bar);
+    if (run_display)
+      setup_bar(bar);
     wl_list_insert(&bar_list, &bar->link);
   } else if (!strcmp(interface, wl_seat_interface.name)) {
     Seat *seat = calloc(1, sizeof(Seat));
-    if (!seat) EDIE("calloc");
+    if (!seat)
+      EDIE("calloc");
     seat->registry_name = name;
     seat->wl_seat = wl_registry_bind(registry, name, &wl_seat_interface, 7);
     wl_seat_add_listener(seat->wl_seat, &seat_listener, seat);
     wl_list_insert(&seat_list, &seat->link);
+  } else if (!strcmp(interface, zdwl_ipc_manager_v2_interface.name)) {
+    dwl_ipc_manager =
+        wl_registry_bind(registry, name, &zdwl_ipc_manager_v2_interface, 2);
+    zdwl_ipc_manager_v2_add_listener(dwl_ipc_manager, &dwl_ipc_manager_listener,
+                                     NULL);
   }
 }
 
 static void teardown_bar(Bar *bar) {
-  if (bar->status.colors) free(bar->status.colors);
-  if (bar->status.buttons) free(bar->status.buttons);
-  if (bar->title.colors) free(bar->title.colors);
-  if (bar->title.buttons) free(bar->title.buttons);
-  if (bar->window_title) free(bar->window_title);
-  if (bar->appid) free(bar->appid);
-  if (bar->layout) free(bar->layout);
-  if (bar->xdg_output_name) free(bar->xdg_output_name);
+  if (bar->status.colors)
+    free(bar->status.colors);
+  if (bar->status.buttons)
+    free(bar->status.buttons);
+  if (bar->title.colors)
+    free(bar->title.colors);
+  if (bar->title.buttons)
+    free(bar->title.buttons);
+  if (bar->window_title)
+    free(bar->window_title);
+  if (bar->appid)
+    free(bar->appid);
+  if (bar->layout)
+    free(bar->layout);
+  if (bar->xdg_output_name)
+    free(bar->xdg_output_name);
   if (!bar->hidden) {
     zwlr_layer_surface_v1_destroy(bar->layer_surface);
     wl_surface_destroy(bar->wl_surface);
@@ -1082,7 +1152,8 @@ static void teardown_bar(Bar *bar) {
 }
 
 static void teardown_seat(Seat *seat) {
-  if (seat->wl_pointer) wl_pointer_destroy(seat->wl_pointer);
+  if (seat->wl_pointer)
+    wl_pointer_destroy(seat->wl_pointer);
   wl_seat_destroy(seat->wl_seat);
   free(seat);
 }
@@ -1125,8 +1196,12 @@ static int advance_word(char **beg, char **end) {
 }
 
 #define ADVANCE() advance_word(&wordbeg, &wordend)
-#define ADVANCE_IF_LAST_CONT() if (ADVANCE() == -1) continue
-#define ADVANCE_IF_LAST_RET()  if (ADVANCE() == -1) return
+#define ADVANCE_IF_LAST_CONT()                                                 \
+  if (ADVANCE() == -1)                                                         \
+  continue
+#define ADVANCE_IF_LAST_RET()                                                  \
+  if (ADVANCE() == -1)                                                         \
+  return
 
 static void read_stdin(void) {
   size_t len = 0;
@@ -1377,11 +1452,16 @@ static void parse_into_customtext(CustomText *ct, char *text) {
       last_cp = codepoint;
       x += kern + glyph->advance.x;
     }
-    if (left_button) left_button->x2 = x;
-    if (middle_button) middle_button->x2 = x;
-    if (right_button) right_button->x2 = x;
-    if (scrollup_button) scrollup_button->x2 = x;
-    if (scrolldown_button) scrolldown_button->x2 = x;
+    if (left_button)
+      left_button->x2 = x;
+    if (middle_button)
+      middle_button->x2 = x;
+    if (right_button)
+      right_button->x2 = x;
+    if (scrollup_button)
+      scrollup_button->x2 = x;
+    if (scrolldown_button)
+      scrolldown_button->x2 = x;
     ct->text[str_pos] = '\0';
   } else {
     snprintf(ct->text, sizeof ct->text, "%s", text);
@@ -1488,41 +1568,49 @@ static void read_socket(void) {
     if (all) {
       wl_list_for_each(bar, &bar_list, link) if (bar->hidden) show_bar(bar);
     } else {
-      if (bar->hidden) show_bar(bar);
+      if (bar->hidden)
+        show_bar(bar);
     }
   } else if (!strcmp(wordbeg, "hide")) {
     if (all) {
       wl_list_for_each(bar, &bar_list, link) if (!bar->hidden) hide_bar(bar);
     } else {
-      if (!bar->hidden) hide_bar(bar);
+      if (!bar->hidden)
+        hide_bar(bar);
     }
   } else if (!strcmp(wordbeg, "toggle-visibility")) {
     if (all) {
       wl_list_for_each(bar, &bar_list, link) if (bar->hidden) show_bar(bar);
       else hide_bar(bar);
     } else {
-      if (bar->hidden) show_bar(bar);
-      else hide_bar(bar);
+      if (bar->hidden)
+        show_bar(bar);
+      else
+        hide_bar(bar);
     }
   } else if (!strcmp(wordbeg, "set-top")) {
     if (all) {
       wl_list_for_each(bar, &bar_list, link) if (bar->bottom) set_top(bar);
     } else {
-      if (bar->bottom) set_top(bar);
+      if (bar->bottom)
+        set_top(bar);
     }
   } else if (!strcmp(wordbeg, "set-bottom")) {
     if (all) {
       wl_list_for_each(bar, &bar_list, link) if (!bar->bottom) set_bottom(bar);
     } else {
-      if (!bar->bottom) set_bottom(bar);
+      if (!bar->bottom)
+        set_bottom(bar);
     }
   } else if (!strcmp(wordbeg, "toggle-location")) {
     if (all) {
       wl_list_for_each(bar, &bar_list, link) if (bar->bottom) set_top(bar);
       else set_bottom(bar);
     } else {
-      if (bar->bottom) set_top(bar);
-      else set_bottom(bar);
+      if (bar->bottom)
+        set_top(bar);
+      else
+        set_bottom(bar);
     }
   }
 }
@@ -1552,7 +1640,8 @@ static void event_loop(void) {
     wl_display_flush(display);
 
     if (select(max_fd + 1, &rfds, NULL, NULL, NULL) == -1) {
-      if (errno == EINTR) continue;
+      if (errno == EINTR)
+        continue;
       EDIE("select");
     }
 
@@ -1573,11 +1662,13 @@ static void event_loop(void) {
             ipc_buf_len += n;
             ipc_buf[ipc_buf_len] = '\0';
             ipc_process_data();
-          } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+          } else if (n == 0 ||
+                     (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
             close(bar->ipc_fd);
             bar->ipc_fd = -1;
             ipc_buf_len = 0;
-            fprintf(stderr, "IPC connection lost for %s\n", bar->xdg_output_name);
+            fprintf(stderr, "IPC connection lost for %s\n",
+                    bar->xdg_output_name);
           }
         }
       }
@@ -1585,7 +1676,8 @@ static void event_loop(void) {
 
     wl_list_for_each(bar, &bar_list, link) {
       if (bar->redraw) {
-        if (!bar->hidden) draw_frame(bar);
+        if (!bar->hidden)
+          draw_frame(bar);
         bar->redraw = false;
       }
     }
@@ -1650,18 +1742,21 @@ int main(int argc, char **argv) {
   char *target_socket = NULL;
   int i = 1;
   if (argc > 1 && !strcmp(argv[1], "-target-socket")) {
-    if (2 >= argc) DIE("Option -socket requires an argument");
+    if (2 >= argc)
+      DIE("Option -socket requires an argument");
     target_socket = argv[2];
     i += 2;
   }
   for (; i < argc; i++) {
     if (!strcmp(argv[i], "-status")) {
-      if (++i + 1 >= argc) DIE("Option -status requires two arguments");
+      if (++i + 1 >= argc)
+        DIE("Option -status requires two arguments");
       client_send_command(&sock_address, argv[i], "status", argv[i + 1],
                           target_socket);
       return 0;
     } else if (!strcmp(argv[i], "-status-stdin")) {
-      if (++i >= argc) DIE("Option -status-stdin requires an argument");
+      if (++i >= argc)
+        DIE("Option -status-stdin requires an argument");
       char *status = malloc(TEXT_MAX * sizeof(char));
       while (fgets(status, TEXT_MAX - 1, stdin)) {
         status[strlen(status) - 1] = '\0';
@@ -1671,35 +1766,42 @@ int main(int argc, char **argv) {
       free(status);
       return 0;
     } else if (!strcmp(argv[i], "-title")) {
-      if (++i + 1 >= argc) DIE("Option -title requires two arguments");
+      if (++i + 1 >= argc)
+        DIE("Option -title requires two arguments");
       client_send_command(&sock_address, argv[i], "title", argv[i + 1],
                           target_socket);
       return 0;
     } else if (!strcmp(argv[i], "-show")) {
-      if (++i >= argc) DIE("Option -show requires an argument");
+      if (++i >= argc)
+        DIE("Option -show requires an argument");
       client_send_command(&sock_address, argv[i], "show", NULL, target_socket);
       return 0;
     } else if (!strcmp(argv[i], "-hide")) {
-      if (++i >= argc) DIE("Option -hide requires an argument");
+      if (++i >= argc)
+        DIE("Option -hide requires an argument");
       client_send_command(&sock_address, argv[i], "hide", NULL, target_socket);
       return 0;
     } else if (!strcmp(argv[i], "-toggle-visibility")) {
-      if (++i >= argc) DIE("Option -toggle requires an argument");
+      if (++i >= argc)
+        DIE("Option -toggle requires an argument");
       client_send_command(&sock_address, argv[i], "toggle-visibility", NULL,
                           target_socket);
       return 0;
     } else if (!strcmp(argv[i], "-set-top")) {
-      if (++i >= argc) DIE("Option -set-top requires an argument");
+      if (++i >= argc)
+        DIE("Option -set-top requires an argument");
       client_send_command(&sock_address, argv[i], "set-top", NULL,
                           target_socket);
       return 0;
     } else if (!strcmp(argv[i], "-set-bottom")) {
-      if (++i >= argc) DIE("Option -set-bottom requires an argument");
+      if (++i >= argc)
+        DIE("Option -set-bottom requires an argument");
       client_send_command(&sock_address, argv[i], "set-bottom", NULL,
                           target_socket);
       return 0;
     } else if (!strcmp(argv[i], "-toggle-location")) {
-      if (++i >= argc) DIE("Option -toggle-location requires an argument");
+      if (++i >= argc)
+        DIE("Option -toggle-location requires an argument");
       client_send_command(&sock_address, argv[i], "toggle-location", NULL,
                           target_socket);
       return 0;
@@ -1736,41 +1838,51 @@ int main(int argc, char **argv) {
     } else if (!strcmp(argv[i], "-no-active-color-title")) {
       active_color_title = false;
     } else if (!strcmp(argv[i], "-font")) {
-      if (++i >= argc) DIE("Option -font requires an argument");
+      if (++i >= argc)
+        DIE("Option -font requires an argument");
       fontstr = argv[i];
     } else if (!strcmp(argv[i], "-vertical-padding")) {
-      if (++i >= argc) DIE("Option -vertical-padding requires an argument");
+      if (++i >= argc)
+        DIE("Option -vertical-padding requires an argument");
       vertical_padding = MAX(MIN(atoi(argv[i]), 100), 0);
     } else if (!strcmp(argv[i], "-active-fg-color")) {
-      if (++i >= argc) DIE("Option -active-fg-color requires an argument");
+      if (++i >= argc)
+        DIE("Option -active-fg-color requires an argument");
       if (parse_color(argv[i], &active_fg_color) == -1)
         DIE("malformed color string");
     } else if (!strcmp(argv[i], "-active-bg-color")) {
-      if (++i >= argc) DIE("Option -active-bg-color requires an argument");
+      if (++i >= argc)
+        DIE("Option -active-bg-color requires an argument");
       if (parse_color(argv[i], &active_bg_color) == -1)
         DIE("malformed color string");
     } else if (!strcmp(argv[i], "-occupied-fg-color")) {
-      if (++i >= argc) DIE("Option -occupied-fg-color requires an argument");
+      if (++i >= argc)
+        DIE("Option -occupied-fg-color requires an argument");
       if (parse_color(argv[i], &occupied_fg_color) == -1)
         DIE("malformed color string");
     } else if (!strcmp(argv[i], "-occupied-bg-color")) {
-      if (++i >= argc) DIE("Option -occupied-bg-color requires an argument");
+      if (++i >= argc)
+        DIE("Option -occupied-bg-color requires an argument");
       if (parse_color(argv[i], &occupied_bg_color) == -1)
         DIE("malformed color string");
     } else if (!strcmp(argv[i], "-inactive-fg-color")) {
-      if (++i >= argc) DIE("Option -inactive-fg-color requires an argument");
+      if (++i >= argc)
+        DIE("Option -inactive-fg-color requires an argument");
       if (parse_color(argv[i], &inactive_fg_color) == -1)
         DIE("malformed color string");
     } else if (!strcmp(argv[i], "-inactive-bg-color")) {
-      if (++i >= argc) DIE("Option -inactive-bg-color requires an argument");
+      if (++i >= argc)
+        DIE("Option -inactive-bg-color requires an argument");
       if (parse_color(argv[i], &inactive_bg_color) == -1)
         DIE("malformed color string");
     } else if (!strcmp(argv[i], "-urgent-fg-color")) {
-      if (++i >= argc) DIE("Option -urgent-fg-color requires an argument");
+      if (++i >= argc)
+        DIE("Option -urgent-fg-color requires an argument");
       if (parse_color(argv[i], &urgent_fg_color) == -1)
         DIE("malformed color string");
     } else if (!strcmp(argv[i], "-urgent-bg-color")) {
-      if (++i >= argc) DIE("Option -urgent-bg-color requires an argument");
+      if (++i >= argc)
+        DIE("Option -urgent-bg-color requires an argument");
       if (parse_color(argv[i], &urgent_bg_color) == -1)
         DIE("malformed color string");
     } else if (!strcmp(argv[i], "-middle-bg-color-selected")) {
@@ -1779,28 +1891,35 @@ int main(int argc, char **argv) {
       if (parse_color(argv[i], &middle_bg_color_selected) == -1)
         DIE("malformed color string");
     } else if (!strcmp(argv[i], "-middle-bg-color")) {
-      if (++i >= argc) DIE("Option -middle-bg-color requires an argument");
+      if (++i >= argc)
+        DIE("Option -middle-bg-color requires an argument");
       if (parse_color(argv[i], &middle_bg_color) == -1)
         DIE("malformed color string");
     } else if (!strcmp(argv[i], "-tags")) {
-      if (++i >= argc) DIE("Option -tags requires at least one argument");
+      if (++i >= argc)
+        DIE("Option -tags requires at least one argument");
       int v;
       if ((v = atoi(argv[i])) < 0 || i + v >= argc)
         DIE("-tags: invalid arguments");
       if (tags) {
-        for (uint32_t j = 0; j < tags_l; j++) free(tags[j]);
+        for (uint32_t j = 0; j < tags_l; j++)
+          free(tags[j]);
         free(tags);
       }
-      if (!(tags = malloc(v * sizeof(char *)))) EDIE("malloc");
+      if (!(tags = malloc(v * sizeof(char *))))
+        EDIE("malloc");
       for (int j = 0; j < v; j++)
-        if (!(tags[j] = strdup(argv[i + 1 + j]))) EDIE("strdup");
+        if (!(tags[j] = strdup(argv[i + 1 + j])))
+          EDIE("strdup");
       tags_l = tags_c = v;
       i += v;
     } else if (!strcmp(argv[i], "-scale")) {
-      if (++i >= argc) DIE("Option -scale requires an argument");
+      if (++i >= argc)
+        DIE("Option -scale requires an argument");
       char *end;
       buffer_scale = strtoul(argv[i], &end, 10);
-      if (*end) DIE("Invalid number for -scale");
+      if (*end)
+        DIE("Invalid number for -scale");
     } else if (!strcmp(argv[i], "-v")) {
       fprintf(stderr, PROGRAM " " VERSION "\n");
       return 0;
@@ -1813,7 +1932,8 @@ int main(int argc, char **argv) {
   }
 
   display = wl_display_connect(NULL);
-  if (!display) DIE("Failed to create display");
+  if (!display)
+    DIE("Failed to create display");
 
   wl_list_init(&bar_list);
   wl_list_init(&seat_list);
@@ -1841,7 +1961,8 @@ int main(int argc, char **argv) {
       EDIE("malloc");
     tags_l = tags_c = LENGTH(tags_names);
     for (uint32_t i = 0; i < tags_l; i++)
-      if (!(tags[i] = strdup(tags_names[i]))) EDIE("strdup");
+      if (!(tags[i] = strdup(tags_names[i])))
+        EDIE("strdup");
   }
 
   wl_list_for_each(bar, &bar_list, link) setup_bar(bar);
@@ -1849,10 +1970,8 @@ int main(int argc, char **argv) {
 
   if (ipc) {
     wl_display_roundtrip(display);
-    wl_list_for_each(bar, &bar_list, link) {
-        ipc_send_watch(bar);
-		}
-	}
+    wl_list_for_each(bar, &bar_list, link) { ipc_send_watch(bar); }
+  }
 
   bool found = false;
   for (uint32_t i = 0; i < 50; i++) {
@@ -1867,7 +1986,8 @@ int main(int argc, char **argv) {
     }
     close(sock_fd);
   }
-  if (!found) DIE("Could not secure a socket path");
+  if (!found)
+    DIE("Could not secure a socket path");
   socketpath = (char *)&sock_address.sun_path;
   unlink(socketpath);
   if (bind(sock_fd, (struct sockaddr *)&sock_address, sizeof sock_address) ==
@@ -1887,14 +2007,18 @@ int main(int argc, char **argv) {
 
   close(sock_fd);
   unlink(socketpath);
-  if (ipc && ipc_fd >= 0) close(ipc_fd);
-  if (!ipc) free(stdinbuf);
+  if (ipc && ipc_fd >= 0)
+    close(ipc_fd);
+  if (!ipc)
+    free(stdinbuf);
   if (tags) {
-    for (uint32_t i = 0; i < tags_l; i++) free(tags[i]);
+    for (uint32_t i = 0; i < tags_l; i++)
+      free(tags[i]);
     free(tags);
   }
   if (layouts) {
-    for (uint32_t i = 0; i < layouts_l; i++) free(layouts[i]);
+    for (uint32_t i = 0; i < layouts_l; i++)
+      free(layouts[i]);
     free(layouts);
   }
   wl_list_for_each_safe(bar, bar2, &bar_list, link) teardown_bar(bar);
