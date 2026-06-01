@@ -60,10 +60,10 @@
     (ptr) = &(arr)[(len) - 1];                                                 \
   } while (0)
 
-#define PROGRAM "mangobar"
+#define PROGRAM "somebar"
 #define VERSION "0.2"
 #define USAGE                                                                  \
-  "usage: mangobar [OPTIONS]\n"                                                \
+  "usage: somebar [OPTIONS]\n"                                                \
   "Ipc\n"                                                                      \
   "	-ipc				allow commands ipc "                                           \
   "	-no-ipc				disable ipc\n"                                                  \
@@ -178,8 +178,10 @@ typedef struct {
   CustomText title, status;
 
   bool hidden, bottom;
-  bool overview;            /* 是否为 OVERVIEW 模式 */
+  bool overview;
   bool redraw;
+
+  int ipc_fd;
 
   struct wl_list link;
 } Bar;
@@ -396,9 +398,7 @@ static int draw_frame(Bar *bar) {
   uint32_t boxs = font->height / 9;
   uint32_t boxw = font->height / 6 + 2;
 
-  /* ---------- 标签区域 ---------- */
   if (bar->overview) {
-    /* OVERVIEW 模式：只显示 "OVERVIEW" 字符串，用激活颜色 */
     x = draw_text("OVERVIEW", x, y, foreground, foreground_mask, background,
                   &active_fg_color, &active_bg_color, bar->width, bar->height,
                   bar->textpadding, NULL, 0);
@@ -485,13 +485,13 @@ static int draw_frame(Bar *bar) {
   x = nx;
 
   x = draw_text(
-      custom_title ? bar->title.text : bar->window_title, x, y, foreground,
-      foreground_mask, background,
-      (bar->sel && active_color_title) ? &active_fg_color : &inactive_fg_color,
-      (bar->sel && active_color_title) ? &active_bg_color : &inactive_bg_color,
-      bar->width - status_width, bar->height, 0,
-      custom_title ? bar->title.colors : NULL,
-      custom_title ? bar->title.colors_l : 0);
+    custom_title ? bar->title.text : bar->window_title, x, y, foreground,
+    foreground_mask, background,
+    bar->sel ? &title_fg_color_selected : &title_fg_color,  
+    &middle_bg_color,                                        
+    bar->width - status_width, bar->height, 0,
+    custom_title ? bar->title.colors : NULL,
+    custom_title ? bar->title.colors_l : 0);
 
   pixman_image_fill_boxes(
       PIXMAN_OP_SRC, background,
@@ -644,7 +644,6 @@ static void pointer_frame(void *data, struct wl_pointer *pointer) {
   Bar *bar = seat->bar;
   uint32_t x = 0, i = 0;
 
-  /* 如果是 OVERVIEW 模式，不处理标签点击 */
   if (!bar->overview) {
     do {
       if (hide_vacant) {
@@ -658,7 +657,6 @@ static void pointer_frame(void *data, struct wl_pointer *pointer) {
     } while (seat->pointer_x >= x && ++i < tags_l);
 
     if (i < tags_l) {
-      /* 点击标签 -> JSON IPC dispatch */
       if (ipc && ipc_fd >= 0) {
         char cmd[256];
         if (seat->pointer_button == BTN_LEFT)
@@ -845,7 +843,7 @@ static void check_auto_hide(Bar *bar) {
   }
 }
 
-/* ========== JSON IPC 处理 ========== */
+/* ========== JSON IPC  ========== */
 
 static Bar *find_bar_by_name(const char *name) {
   Bar *bar;
@@ -859,24 +857,27 @@ static Bar *find_bar_by_name(const char *name) {
 static void ipc_update_bar_from_json(Bar *bar, cJSON *json) {
   if (!bar || !json) return;
 
-  /* 更新 active */
+  /* active */
   cJSON *active = cJSON_GetObjectItem(json, "active");
   if (cJSON_IsBool(active))
     bar->sel = cJSON_IsTrue(active) ? 1 : 0;
 
-  /* 更新 layout_symbol */
+  /* layout_symbol */
   cJSON *layout_sym = cJSON_GetObjectItem(json, "layout_symbol");
   if (cJSON_IsString(layout_sym)) {
     free(bar->layout);
-    bar->layout = strdup(layout_sym->valuestring);
+	const char *sym = layout_sym->valuestring;
+    if      (!strcmp(sym, "DW")) sym = "[]=";
+    else if (!strcmp(sym, "M"))  sym = "[M]";
+    bar->layout = strdup(sym);
   }
 
-  /* 更新 layout_index */
+  /* layout_index */
   cJSON *layout_idx = cJSON_GetObjectItem(json, "layout_index");
   if (cJSON_IsNumber(layout_idx))
     bar->layout_idx = layout_idx->valueint;
 
-  /* 更新 active_client */
+  /* active_client */
   cJSON *active_client = cJSON_GetObjectItem(json, "active_client");
   if (active_client && !cJSON_IsNull(active_client)) {
     cJSON *title = cJSON_GetObjectItem(active_client, "title");
@@ -902,7 +903,7 @@ static void ipc_update_bar_from_json(Bar *bar, cJSON *json) {
     bar->appid = NULL;
   }
 
-  /* 更新 tags */
+  /* tags */
   cJSON *tags_array = cJSON_GetObjectItem(json, "tags");
   if (cJSON_IsArray(tags_array)) {
     bar->mtags = bar->ctags = bar->urg = 0;
@@ -919,7 +920,7 @@ static void ipc_update_bar_from_json(Bar *bar, cJSON *json) {
     }
   }
 
-  /* 解析 active_tags，判断 OVERVIEW 模式 */
+  /* active_tags，OVERVIEW */
   cJSON *active_tags = cJSON_GetObjectItem(json, "active_tags");
   bar->overview = false;
   if (cJSON_IsArray(active_tags)) {
@@ -932,7 +933,6 @@ static void ipc_update_bar_from_json(Bar *bar, cJSON *json) {
     }
   }
 
-  /* 自动隐藏检查 */
   check_auto_hide(bar);
   bar->redraw = true;
 }
@@ -990,13 +990,31 @@ static void ipc_connect(void) {
 }
 
 static void ipc_send_watch(Bar *bar) {
-  if (ipc_fd < 0 || !bar->xdg_output_name) return;
+  if (!bar->xdg_output_name) return;
+
+  const char *sock_path = getenv("MANGO_INSTANCE_SIGNATURE");
+  if (!sock_path) return;
+
+  bar->ipc_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (bar->ipc_fd < 0) { perror("bar ipc socket"); return; }
+
+  struct sockaddr_un addr = {.sun_family = AF_UNIX};
+  strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+
+  if (connect(bar->ipc_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+    perror("bar ipc connect");
+    close(bar->ipc_fd);
+    bar->ipc_fd = -1;
+    return;
+  }
+
+  int flags = fcntl(bar->ipc_fd, F_GETFL, 0);
+  fcntl(bar->ipc_fd, F_SETFL, flags | O_NONBLOCK);
+
   char msg[256];
   snprintf(msg, sizeof msg, "watch monitor %s\n", bar->xdg_output_name);
-  send(ipc_fd, msg, strlen(msg), MSG_NOSIGNAL);
+  send(bar->ipc_fd, msg, strlen(msg), MSG_NOSIGNAL);
 }
-
-/* ========== 全局对象绑定 ========== */
 
 static void setup_bar(Bar *bar) {
   bar->height = height * buffer_scale;
@@ -1031,6 +1049,7 @@ static void handle_global(void *data, struct wl_registry *registry,
     Bar *bar = calloc(1, sizeof(Bar));
     if (!bar) EDIE("calloc");
     bar->registry_name = name;
+	bar->ipc_fd = -1;
     bar->wl_output = wl_registry_bind(registry, name, &wl_output_interface, 1);
     if (run_display) setup_bar(bar);
     wl_list_insert(&bar_list, &bar->link);
@@ -1517,11 +1536,19 @@ static void event_loop(void) {
     FD_SET(sock_fd, &rfds);
     if (!ipc)
       FD_SET(STDIN_FILENO, &rfds);
-    if (ipc && ipc_fd >= 0)
-      FD_SET(ipc_fd, &rfds);
 
     int max_fd = MAX(sock_fd, wl_fd);
-    if (ipc && ipc_fd >= 0) max_fd = MAX(max_fd, ipc_fd);
+
+    Bar *bar;
+    if (ipc) {
+      wl_list_for_each(bar, &bar_list, link) {
+        if (bar->ipc_fd >= 0) {
+          FD_SET(bar->ipc_fd, &rfds);
+          max_fd = MAX(max_fd, bar->ipc_fd);
+        }
+      }
+    }
+
     wl_display_flush(display);
 
     if (select(max_fd + 1, &rfds, NULL, NULL, NULL) == -1) {
@@ -1536,22 +1563,26 @@ static void event_loop(void) {
       read_socket();
     if (!ipc && FD_ISSET(STDIN_FILENO, &rfds))
       read_stdin();
-    if (ipc && ipc_fd >= 0 && FD_ISSET(ipc_fd, &rfds)) {
-      ssize_t n = read(ipc_fd, ipc_buf + ipc_buf_len,
-                       sizeof(ipc_buf) - ipc_buf_len - 1);
-      if (n > 0) {
-        ipc_buf_len += n;
-        ipc_buf[ipc_buf_len] = '\0';
-        ipc_process_data();
-      } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-        close(ipc_fd);
-        ipc_fd = -1;
-        ipc_buf_len = 0;
-        fprintf(stderr, "IPC connection lost\n");
+
+    if (ipc) {
+      wl_list_for_each(bar, &bar_list, link) {
+        if (bar->ipc_fd >= 0 && FD_ISSET(bar->ipc_fd, &rfds)) {
+          ssize_t n = read(bar->ipc_fd, ipc_buf + ipc_buf_len,
+                           sizeof(ipc_buf) - ipc_buf_len - 1);
+          if (n > 0) {
+            ipc_buf_len += n;
+            ipc_buf[ipc_buf_len] = '\0';
+            ipc_process_data();
+          } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            close(bar->ipc_fd);
+            bar->ipc_fd = -1;
+            ipc_buf_len = 0;
+            fprintf(stderr, "IPC connection lost for %s\n", bar->xdg_output_name);
+          }
+        }
       }
     }
 
-    Bar *bar;
     wl_list_for_each(bar, &bar_list, link) {
       if (bar->redraw) {
         if (!bar->hidden) draw_frame(bar);
@@ -1575,7 +1606,7 @@ static void client_send_command(struct sockaddr_un *sock_address,
   struct dirent *de;
   bool newfd = true;
   while ((de = readdir(dir))) {
-    if (!strncmp(de->d_name, "mangobar-", 9)) {
+    if (!strncmp(de->d_name, "somebar-", 9)) {
       if (!target_socket || !strncmp(de->d_name, target_socket, 6)) {
         if (newfd && (sock_fd = socket(AF_UNIX, SOCK_STREAM, 1)) == -1)
           EDIE("socket");
@@ -1610,7 +1641,7 @@ int main(int argc, char **argv) {
 
   if (!(xdgruntimedir = getenv("XDG_RUNTIME_DIR")))
     DIE("Could not retrieve XDG_RUNTIME_DIR");
-  snprintf(socketdir, sizeof socketdir, "%s/mangobar", xdgruntimedir);
+  snprintf(socketdir, sizeof socketdir, "%s/somebar", xdgruntimedir);
   if (mkdir(socketdir, S_IRWXU) == -1)
     if (errno != EEXIST)
       EDIE("Could not create directory '%s'", socketdir);
@@ -1805,7 +1836,6 @@ int main(int argc, char **argv) {
   textpadding = font->height / 2;
   height = font->height / buffer_scale + vertical_padding * 2;
 
-  /* 初始化标签：无论是否 IPC，只要 tags 为空就加载默认值 */
   if (!tags) {
     if (!(tags = malloc(LENGTH(tags_names) * sizeof(char *))))
       EDIE("malloc");
@@ -1818,28 +1848,18 @@ int main(int argc, char **argv) {
   wl_display_roundtrip(display);
 
   if (ipc) {
-    ipc_connect();
-    if (ipc_fd >= 0) {
-      wl_display_roundtrip(display);
-      wl_list_for_each(bar, &bar_list, link) {
+    wl_display_roundtrip(display);
+    wl_list_for_each(bar, &bar_list, link) {
         ipc_send_watch(bar);
-      }
-    } else {
-      fprintf(stderr, "IPC enabled but connection failed\n");
-    }
-  } else {
-    if (fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK) == -1)
-      EDIE("fcntl");
-    if (!(stdinbuf = malloc(1024))) EDIE("malloc");
-    stdinbuf_cap = 1024;
-  }
+		}
+	}
 
   bool found = false;
   for (uint32_t i = 0; i < 50; i++) {
     if ((sock_fd = socket(AF_UNIX, SOCK_STREAM, 1)) == -1)
       DIE("socket");
     snprintf(sock_address.sun_path, sizeof sock_address.sun_path,
-             "%s/mangobar-%i", socketdir, i);
+             "%s/somebar-%i", socketdir, i);
     if (connect(sock_fd, (struct sockaddr *)&sock_address,
                 sizeof sock_address) == -1) {
       found = true;

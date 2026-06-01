@@ -1,4 +1,4 @@
-BINS = mangobar
+BINS = somebar
 
 PREFIX ?= /usr/local
 CFLAGS += -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -g
@@ -42,13 +42,13 @@ wlr-layer-shell-unstable-v1-protocol.c:
 	$(WAYLAND_SCANNER) private-code protocols/wlr-layer-shell-unstable-v1.xml $@
 wlr-layer-shell-unstable-v1-protocol.o: wlr-layer-shell-unstable-v1-protocol.h
 
-mangobar.o: mangobar.c utf8.h config.h xdg-shell-protocol.h xdg-output-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h
+somebar.o: somebar.c utf8.h config.h xdg-shell-protocol.h xdg-output-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-mangobar: $(PROTOCOL_OBJS) mangobar.o
+somebar: $(PROTOCOL_OBJS) somebar.o
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-mangobar: CFLAGS+=$(shell pkg-config --cflags wayland-client wayland-cursor fcft pixman-1)
-mangobar: LDLIBS+=$(shell pkg-config --libs wayland-client wayland-cursor fcft pixman-1) -lrt -lcjson
+somebar: CFLAGS+=$(shell pkg-config --cflags wayland-client wayland-cursor fcft pixman-1)
+somebar: LDLIBS+=$(shell pkg-config --libs wayland-client wayland-cursor fcft pixman-1) -lrt -lcjson
 
 .PHONY: all clean install uninstall
