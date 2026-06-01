@@ -183,6 +183,8 @@ typedef struct {
   bool redraw;
 
   int ipc_fd;
+  char ipc_buf[65536];
+  size_t ipc_buf_len;
 
   struct wl_list link;
 } Bar;
@@ -224,18 +226,11 @@ static struct wl_list bar_list, seat_list;
 
 static char **tags;
 static uint32_t tags_l, tags_c;
-static char **layouts;
-static uint32_t layouts_l, layouts_c;
 
 static struct fcft_font *font;
 static uint32_t height, textpadding, buffer_scale;
 
 static bool run_display;
-
-/* JSON IPC */
-static int ipc_fd = -1;
-static char ipc_buf[65536];
-static size_t ipc_buf_len = 0;
 
 #include "config.h"
 
@@ -987,43 +982,16 @@ static void ipc_handle_message(const char *msg) {
   cJSON_Delete(json);
 }
 
-static void ipc_process_data(void) {
-  char *line = ipc_buf, *end;
-  while ((end = memchr(line, '\n', ipc_buf_len - (line - ipc_buf)))) {
+static void ipc_process_data(Bar *bar) {
+  char *line = bar->ipc_buf, *end;
+  while ((end = memchr(line, '\n', bar->ipc_buf_len - (line - bar->ipc_buf)))) {
     *end = '\0';
     ipc_handle_message(line);
     line = end + 1;
   }
-  size_t remaining = ipc_buf_len - (line - ipc_buf);
-  memmove(ipc_buf, line, remaining);
-  ipc_buf_len = remaining;
-}
-
-static void ipc_connect(void) {
-  const char *sock_path = getenv("MANGO_INSTANCE_SIGNATURE");
-  if (!sock_path) {
-    fprintf(stderr, "IPC: MANGO_INSTANCE_SIGNATURE not set\n");
-    return;
-  }
-
-  ipc_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (ipc_fd < 0) {
-    perror("IPC socket");
-    return;
-  }
-
-  struct sockaddr_un addr = {.sun_family = AF_UNIX};
-  strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
-
-  if (connect(ipc_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-    perror("IPC connect");
-    close(ipc_fd);
-    ipc_fd = -1;
-    return;
-  }
-
-  int flags = fcntl(ipc_fd, F_GETFL, 0);
-  fcntl(ipc_fd, F_SETFL, flags | O_NONBLOCK);
+  size_t remaining = bar->ipc_buf_len - (line - bar->ipc_buf);
+  memmove(bar->ipc_buf, line, remaining);
+  bar->ipc_buf_len = remaining;
 }
 
 static void ipc_send_watch(Bar *bar) {
@@ -1148,6 +1116,7 @@ static void teardown_bar(Bar *bar) {
   }
   zxdg_output_v1_destroy(bar->xdg_output);
   wl_output_destroy(bar->wl_output);
+  if (bar->ipc_fd >= 0) close(bar->ipc_fd);
   free(bar);
 }
 
@@ -1622,7 +1591,6 @@ static void event_loop(void) {
     FD_ZERO(&rfds);
     FD_SET(wl_fd, &rfds);
     FD_SET(sock_fd, &rfds);
-	struct timeval tv = {.tv_sec = 0, .tv_usec = 50000};
     if (!ipc)
       FD_SET(STDIN_FILENO, &rfds);
 
@@ -1640,7 +1608,7 @@ static void event_loop(void) {
 
     wl_display_flush(display);
 
-    if (select(max_fd + 1, &rfds, NULL, NULL, &tv) == -1) {
+    if (select(max_fd + 1, &rfds, NULL, NULL, NULL) == -1) {
       if (errno == EINTR)
         continue;
       EDIE("select");
@@ -1653,23 +1621,21 @@ static void event_loop(void) {
       read_socket();
     if (!ipc && FD_ISSET(STDIN_FILENO, &rfds))
       read_stdin();
-
-    if (ipc) {
+	
+	if (ipc) {
       wl_list_for_each(bar, &bar_list, link) {
         if (bar->ipc_fd >= 0 && FD_ISSET(bar->ipc_fd, &rfds)) {
-          ssize_t n = read(bar->ipc_fd, ipc_buf + ipc_buf_len,
-                           sizeof(ipc_buf) - ipc_buf_len - 1);
+          ssize_t n = read(bar->ipc_fd, bar->ipc_buf + bar->ipc_buf_len,
+                           sizeof(bar->ipc_buf) - bar->ipc_buf_len - 1);
           if (n > 0) {
-            ipc_buf_len += n;
-            ipc_buf[ipc_buf_len] = '\0';
-            ipc_process_data();
-          } else if (n == 0 ||
-                     (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            bar->ipc_buf_len += n;
+            bar->ipc_buf[bar->ipc_buf_len] = '\0';
+            ipc_process_data(bar);
+          } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
             close(bar->ipc_fd);
             bar->ipc_fd = -1;
-            ipc_buf_len = 0;
-            fprintf(stderr, "IPC connection lost for %s\n",
-                    bar->xdg_output_name);
+            bar->ipc_buf_len = 0;
+            fprintf(stderr, "IPC connection lost for %s\n", bar->xdg_output_name);
           }
         }
       }
@@ -1682,7 +1648,7 @@ static void event_loop(void) {
         bar->redraw = false;
       }
     }
-  }
+  } 
 }
 
 static void client_send_command(struct sockaddr_un *sock_address,
@@ -2008,8 +1974,6 @@ int main(int argc, char **argv) {
 
   close(sock_fd);
   unlink(socketpath);
-  if (ipc && ipc_fd >= 0)
-    close(ipc_fd);
   if (!ipc)
     free(stdinbuf);
   if (tags) {
@@ -2017,15 +1981,16 @@ int main(int argc, char **argv) {
       free(tags[i]);
     free(tags);
   }
-  if (layouts) {
-    for (uint32_t i = 0; i < layouts_l; i++)
-      free(layouts[i]);
-    free(layouts);
+  if (layout_names) {
+    for (uint32_t i = 0; i < layout_names_l; i++)
+      free(layout_names[i]);
+    free(layout_names);
   }
   wl_list_for_each_safe(bar, bar2, &bar_list, link) teardown_bar(bar);
   wl_list_for_each_safe(seat, seat2, &seat_list, link) teardown_seat(seat);
   zwlr_layer_shell_v1_destroy(layer_shell);
   zxdg_output_manager_v1_destroy(output_manager);
+  if (dwl_ipc_manager) zdwl_ipc_manager_v2_destroy(dwl_ipc_manager);
   fcft_destroy(font);
   fcft_fini();
   wl_shm_destroy(shm);
