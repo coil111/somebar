@@ -974,15 +974,19 @@ static void ipc_update_bar_from_json(Bar *bar, cJSON *json)
         cJSON *tag_obj;
         cJSON_ArrayForEach(tag_obj, tags_array)
         {
-            int tag = cJSON_GetObjectItem(tag_obj, "index")->valueint - 1;
-            if (tag < 0 || tag >= 32)
-                continue;
+            cJSON *idx = cJSON_GetObjectItem(tag_obj, "index");
+			if (!cJSON_IsNumber(idx))
+				continue;
+			int tag = idx->valueint - 1;
+			if (tag < 0 || tag >= 32)
+				continue;
             if (cJSON_IsTrue(cJSON_GetObjectItem(tag_obj, "is_active")))
                 bar->mtags |= (1 << tag);
             if (cJSON_IsTrue(cJSON_GetObjectItem(tag_obj, "is_urgent")))
                 bar->urg |= (1 << tag);
-            if (cJSON_GetObjectItem(tag_obj, "client_count")->valueint > 0)
-                bar->ctags |= (1 << tag);
+			cJSON *cc = cJSON_GetObjectItem(tag_obj, "client_count");
+			if (cJSON_IsNumber(cc) && cc->valueint > 0)
+				bar->ctags |= (1 << tag);
         }
     }
 
@@ -1742,11 +1746,16 @@ static void event_loop(void)
 
         wl_list_for_each(bar, &bar_list, link)
         {
-            if (bar->redraw) {
-                if (!bar->hidden)
-                    draw_frame(bar);
-                bar->redraw = false;
-            }
+            if (!bar->redraw)
+				continue;
+			if (bar->hidden) {
+				bar->redraw = false;
+			} else if (draw_frame(bar) == 0) {
+				bar->redraw = false;
+			} else {
+				fprintf(stderr, "[somebar] draw_frame failed mon=%s\n",
+						bar->xdg_output_name ? bar->xdg_output_name : "?");
+			}
         }
     }
 }
