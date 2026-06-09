@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
 #include <wayland-cursor.h>
@@ -900,25 +901,6 @@ static void hide_bar(Bar *bar)
     bar->hidden = true;
 }
 
-static void check_auto_hide(Bar *bar)
-{
-    if (!bar->window_title || !bar->appid) {
-        if (bar->hidden)
-            show_bar(bar);
-        return;
-    }
-    bool is_terminal =
-        (strcmp(bar->appid, "foot") == 0 || strcmp(bar->appid, "kitty") == 0);
-    bool is_tmux = (strstr(bar->window_title, "tmux") != NULL);
-    if (is_terminal && is_tmux) {
-        if (!bar->hidden)
-            hide_bar(bar);
-    } else {
-        if (bar->hidden)
-            show_bar(bar);
-    }
-}
-
 /* ========== JSON IPC  ========== */
 
 static Bar *find_bar_by_name(const char *name)
@@ -1017,8 +999,6 @@ static void ipc_update_bar_from_json(Bar *bar, cJSON *json)
             }
         }
     }
-
-    check_auto_hide(bar);
     bar->redraw = true;
 }
 
@@ -1083,6 +1063,17 @@ static void ipc_send_watch(Bar *bar)
     char msg[256];
     snprintf(msg, sizeof msg, "watch monitor %s\n", bar->xdg_output_name);
     send(bar->ipc_fd, msg, strlen(msg), MSG_NOSIGNAL);
+}
+
+static void ipc_close(Bar *bar, const char *why)
+{
+	fprintf(stderr, "[somebar] ipc close mon=%s why=%s errno=%d(%s) buflen=%zu\n",
+			bar->xdg_output_name ? bar->xdg_output_name : "?",
+			why, errno, strerror(errno), bar->ipc_buf_len);
+	if (bar->ipc_fd >= 0) 
+		close(bar->ipc_fd);
+	bar->ipc_fd = -1;
+	bar->ipc_buf_len = 0;
 }
 
 static void setup_bar(Bar *bar)
@@ -1725,24 +1716,29 @@ static void event_loop(void)
             wl_list_for_each(bar, &bar_list, link)
             {
                 if (bar->ipc_fd >= 0 && FD_ISSET(bar->ipc_fd, &rfds)) {
-                    ssize_t n =
-                        read(bar->ipc_fd, bar->ipc_buf + bar->ipc_buf_len,
-                             sizeof(bar->ipc_buf) - bar->ipc_buf_len - 1);
+                    ssize_t n = read(bar->ipc_fd, bar->ipc_buf + bar->ipc_buf_len,
+									sizeof(bar->ipc_buf) - bar->ipc_buf_len - 1);
                     if (n > 0) {
                         bar->ipc_buf_len += n;
                         bar->ipc_buf[bar->ipc_buf_len] = '\0';
                         ipc_process_data(bar);
-                    } else if (n == 0 || (n < 0 && errno != EAGAIN &&
-                                          errno != EWOULDBLOCK)) {
-                        close(bar->ipc_fd);
-                        bar->ipc_fd = -1;
-                        bar->ipc_buf_len = 0;
-                        fprintf(stderr, "IPC connection lost for %s\n",
-                                bar->xdg_output_name);
-                    }
+                    } else if (n == 0) {
+						ipc_close(bar, "peer closed");
+					} else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+						ipc_close(bar, "read error");
+					}
                 }
             }
-        }
+			
+			static time_t last_retry;
+			time_t now = time(NULL);
+			if (now != last_retry) {
+				last_retry = now;
+				wl_list_for_each(bar, &bar_list, link)
+					if (bar->ipc_fd < 0 && bar->xdg_output_name)
+						ipc_send_watch(bar);
+			}
+		}
 
         wl_list_for_each(bar, &bar_list, link)
         {
